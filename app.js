@@ -632,10 +632,9 @@ async function applyRoute() {
 
 function showMobileWarning() {
   const userAgent = navigator.userAgent || '';
-  const mobile = navigator.userAgentData?.mobile === true ||
-    /Android|iPhone|iPod|Windows Phone|IEMobile|BlackBerry|Opera Mini/i.test(userAgent) ||
-    (/Macintosh/i.test(userAgent) && navigator.maxTouchPoints > 1);
-  if (!mobile) return;
+  const platform = navigator.userAgentData?.platform || '';
+  const android = /Android/i.test(userAgent) || /Android/i.test(platform);
+  if (!android) return;
 
   const warning = $('#mobile-warning');
   if (typeof warning.showModal === 'function') warning.showModal();
