@@ -626,7 +626,20 @@ async function applyRoute() {
   showView('library');
 }
 
+function showMobileWarning() {
+  const userAgent = navigator.userAgent || '';
+  const mobile = navigator.userAgentData?.mobile === true ||
+    /Android|iPhone|iPod|Windows Phone|IEMobile|BlackBerry|Opera Mini/i.test(userAgent) ||
+    (/Macintosh/i.test(userAgent) && navigator.maxTouchPoints > 1);
+  if (!mobile) return;
+
+  const warning = $('#mobile-warning');
+  if (typeof warning.showModal === 'function') warning.showModal();
+  else warning.setAttribute('open', '');
+}
+
 async function init() {
+  showMobileWarning();
   try {
     let [savedCoins, savedRecordings] = await Promise.all([getAll('coins'), getAll('recordings')]);
     // Compact profiles created by earlier versions: preserve the selected
