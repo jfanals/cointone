@@ -14,7 +14,6 @@
     </header>
     <main>
       <section id="library-view" class="view active">
-        <div class="hero"><div><h2>Coin library</h2><p>Choose a coin to test it against its own acoustic profile.</p></div></div>
         <div id="coin-grid" class="grid"></div>
         <section class="add-coin-cta">
           <div><h3>Haven’t found the coin you’re looking for?</h3><p>Add your own coin, then teach CoinTone its sound with five clean pings.</p></div>
@@ -23,8 +22,10 @@
       </section>
 
       <section id="teach-view" class="view">
-        <button id="teach-back" class="btn">← Library</button>
-        <div class="hero"><div><h2 id="teach-title">Teach your coin</h2><p>Make five clean pings. Resonances and decay are extracted automatically.</p></div></div>
+        <div class="page-heading">
+          <button id="teach-back" class="btn">← Library</button>
+          <div class="hero"><div><h2 id="teach-title">Teach your coin</h2><p>Make five clean pings. Resonances and decay are extracted automatically.</p></div></div>
+        </div>
         <div class="flow">
           <section class="card capture" aria-live="polite">
             <div id="teach-orb" class="mic-orb"><span class="mic-icon">⌁</span></div>
@@ -55,7 +56,6 @@
 
 
       <section id="detail-view" class="view">
-        <button id="detail-back" class="btn">← Library</button>
         <div id="detail-content"></div>
       </section>
     </main>

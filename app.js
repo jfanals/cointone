@@ -412,7 +412,10 @@ async function showDetail(coinId) {
   const learned = buildProfile(items, coin.includedFrequencies);
   const ready = profile.isReference || (profile.sampleCount >= TRAINING_TARGET && profile.resonances.length >= 2);
   $('#detail-content').innerHTML = `
-    <div class="hero detail-head"><div><h2>Identify ${escapeHtml(coin.name)}</h2><p>Test each ping only against this coin’s acoustic profile.</p></div><div>${coin.urlOnly ? '<button id="add-shared-coin" class="btn primary">Add to library</button> ' : ''}<button id="copy-identify-link" class="btn" ${ready ? '' : 'disabled'}>Share coin</button></div></div>
+    <div class="page-heading">
+      <button id="detail-back" class="btn">← Library</button>
+      <div class="hero detail-head"><div><h2>Identify ${escapeHtml(coin.name)}</h2><p>Test each ping only against this coin’s acoustic profile.</p></div><div>${coin.urlOnly ? '<button id="add-shared-coin" class="btn primary">Add to library</button> ' : ''}<button id="copy-identify-link" class="btn" ${ready ? '' : 'disabled'}>Share coin</button></div></div>
+    </div>
     <div class="flow detail-identify">
       <section class="card capture" aria-live="polite">
         <div id="detail-orb" class="mic-orb"><span class="mic-icon">⌁</span></div>
@@ -434,6 +437,7 @@ async function showDetail(coinId) {
     </div>
     <div class="card"><h3>Target frequencies</h3><div class="resonances">${profile.resonances.map(r => `<span class="resonance">${formatHz(r.frequency)}${r.tolerance ? ` · ±${(r.tolerance * 100).toFixed(1)}%` : ''}</span>`).join('')}</div><p class="hint">This identifier stores only the coin name and target frequencies.</p></div>
     ${!coin.builtIn && !coin.urlOnly ? '<div class="detail-footer-actions"><button id="delete-profile" class="btn danger">Delete</button></div>' : ''}`;
+  $('#detail-back').onclick = () => navigateLibrary();
   $('#copy-identify-link').onclick = async () => {
     try {
       await navigator.clipboard.writeText(new URL(frequencyTargetUrl(coin), location.href).href);
@@ -550,7 +554,7 @@ function wireEvents() {
   $('#teach-start').onclick = () => startCapture('teach');
   $('#teach-stop').onclick = stopCapture;
   $('#finish-teach').onclick = finishTeaching;
-  $('#teach-back').onclick = $('#detail-back').onclick = () => navigateLibrary();
+  $('#teach-back').onclick = () => navigateLibrary();
   window.addEventListener('popstate', applyRoute);
   window.addEventListener('beforeunload', () => {
     activeCapture?.stop();
