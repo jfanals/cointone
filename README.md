@@ -35,7 +35,7 @@ Open [http://localhost:8080](http://localhost:8080) in a current Chromium, Safar
 3. If your coin is not listed, use **Add your coin** at the end of the Library.
 4. Enter its name, capture five clean pings, and review the automatically selected frequencies. You can include or exclude occasional frequencies before choosing **Add to library**.
 5. Calibration recordings are temporary. After creation, only the coin name and selected frequencies are saved.
-6. Use **Copy link** on an identifier to share a portable URL containing its name and target frequencies. A recipient can identify against it immediately or choose **Add to library**.
+6. Use **Share coin** on an identifier to share a portable URL containing its name and target frequencies. A recipient can identify against it immediately or choose **Add to library**.
 
 ## URL-based identifiers
 

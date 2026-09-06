@@ -113,10 +113,10 @@ function renderLibrary() {
     const card = document.createElement('article');
     card.className = 'card coin-card';
     const ready = profileIsReady(coin, profile);
-    const status = coin.builtIn ? 'Built-in' : ready ? 'Saved coin' : 'Calibration incomplete';
+    const status = ready ? 'Saved coin' : 'Calibration incomplete';
     card.innerHTML = `
       ${coinImageMarkup(coin)}
-      <span class="badge ${ready ? '' : 'warn'}">${status}</span>
+      ${coin.builtIn ? '' : `<span class="badge ${ready ? '' : 'warn'}">${status}</span>`}
       <h3>${escapeHtml(coin.name)}</h3>
       <div class="resonances">${profile.resonances.slice(0,4).map(r => `<span class="resonance">${formatHz(r.frequency)}</span>`).join('') || '<span class="hint">No stable resonances yet</span>'}</div>
       <div class="actions">${ready ? `<a class="btn primary identify-card" href="${escapeHtml(identifyUrl(coin))}">Identify</a>` : `<a class="btn primary teach-card" href="${escapeHtml(teachUrl(coin.id))}">Finish calibration</a>`}</div>`;
@@ -412,7 +412,7 @@ async function showDetail(coinId) {
   const learned = buildProfile(items, coin.includedFrequencies);
   const ready = profile.isReference || (profile.sampleCount >= TRAINING_TARGET && profile.resonances.length >= 2);
   $('#detail-content').innerHTML = `
-    <div class="hero detail-head"><div><h2>Identify ${escapeHtml(coin.name)}</h2><p>Test each ping only against this coin’s acoustic profile.</p></div><div>${coin.urlOnly ? '<button id="add-shared-coin" class="btn primary">Add to library</button> ' : ''}<button id="copy-identify-link" class="btn" ${ready ? '' : 'disabled'}>Copy link</button>${!coin.builtIn && !coin.urlOnly ? ' <button id="delete-profile" class="btn danger">Delete</button>' : ''}</div></div>
+    <div class="hero detail-head"><div><h2>Identify ${escapeHtml(coin.name)}</h2><p>Test each ping only against this coin’s acoustic profile.</p></div><div>${coin.urlOnly ? '<button id="add-shared-coin" class="btn primary">Add to library</button> ' : ''}<button id="copy-identify-link" class="btn" ${ready ? '' : 'disabled'}>Share coin</button>${!coin.builtIn && !coin.urlOnly ? ' <button id="delete-profile" class="btn danger">Delete</button>' : ''}</div></div>
     <div class="flow detail-identify">
       <section class="card capture" aria-live="polite">
         <div id="detail-orb" class="mic-orb"><span class="mic-icon">⌁</span></div>
