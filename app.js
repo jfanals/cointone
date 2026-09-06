@@ -631,12 +631,20 @@ async function applyRoute() {
 }
 
 function showMobileWarning() {
-  const userAgent = navigator.userAgent || '';
-  const platform = navigator.userAgentData?.platform || '';
-  const android = /Android/i.test(userAgent) || /Android/i.test(platform);
-  if (!android) return;
-
   const warning = $('#mobile-warning');
+  const userAgent = navigator.userAgent || '';
+  const platform = navigator.userAgentData?.platform || navigator.platform || '';
+  // iPadOS may identify itself as macOS when "Request Desktop Website" is enabled.
+  const appleMobile = /iPhone|iPad|iPod/i.test(userAgent) ||
+    (/Mac/i.test(platform) && navigator.maxTouchPoints > 1);
+  const android = /Android/i.test(userAgent) || /Android/i.test(platform);
+
+  if (appleMobile || !android) {
+    if (warning.open && typeof warning.close === 'function') warning.close();
+    warning.removeAttribute('open');
+    return;
+  }
+
   if (typeof warning.showModal === 'function') warning.showModal();
   else warning.setAttribute('open', '');
 }
