@@ -1,593 +1,658 @@
-// UI Elements
-const startButton = document.getElementById('startButton');
-const stopButton = document.getElementById('stopButton');
-const logBody = document.getElementById('logBody');
-const statusIndicator = document.getElementById('status');
+import { getAll, put, remove, deleteCoinAndRecordings } from './db.js';
+import { PingCapture } from './audio.js';
+import { analyzePing, buildProfile, matchProfile, encodeWav } from './dsp.js';
+import { REFERENCE_COINS } from './references.js';
 
-// Audio Context and Nodes
-let audioContext;
-let analyser;
-let microphone;
-let highPassFilter;
-let dataArray;
-let frequencyDataArray;
-let animationId;
+const $ = selector => document.querySelector(selector);
+const $$ = selector => [...document.querySelectorAll(selector)];
+const uid = () => crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;' }[c]));
+const formatHz = frequency => frequency >= 1000 ? `${(frequency / 1000).toFixed(2)} kHz` : `${Math.round(frequency)} Hz`;
+const relevantResonances = features => features?.resonances?.filter(item => item.frequency >= 2000) || [];
+const TRAINING_TARGET = 5;
 
-// Chart.js setup
-const ctx = document.getElementById('frequencyChart').getContext('2d');
-const chart = new Chart(ctx, {
-    type: 'bar',
-    data: {
-        labels: [], // Frequencies
-        datasets: [{
-            label: 'Detected Frequencies',
-            data: [],
-            type: 'bar',
-            backgroundColor: 'rgba(0, 255, 0, 1)', // Semi-transparent dark green
-            borderColor: 'rgba(0, 255, 0, 1)', // Solid dark green border
-            borderWidth: 2,
-            barPercentage: 50,
-            barThickness: 5,
-        }, {
-            label: 'Non-Matching Frequencies',
-            data: [],
-            type: 'bar',
-            backgroundColor: 'rgba(255, 0, 0, 0.7)', // Semi-transparent red
-            borderColor: 'rgba(255, 0, 0, 1)', // Solid red border
-            borderWidth: 2,
-            barPercentage: 50,
-            barThickness: 5,
-        }, {
-            label: 'Amplitude',
-            data: [], // Amplitudes
-            backgroundColor: 'rgba(0, 123, 255, 0.5)',
-            barPercentage: 50,
-        }, {
-            label: 'Detected Coin Range',
-            data: [],
-            type: 'bar',
-            backgroundColor: 'rgba(0, 255, 0, 0.25)', // Semi-transparent light green
-            borderColor: 'rgba(0, 255, 0, 0.25)', // Solid light green border
-            barPercentage: 1,
-        }]
-    },
-    options: {
-        responsive: true,
-        scales: {
-            x: {
-                type: 'linear',
-                title: {
-                    display: true,
-                    text: 'Frequency (Hz)'
-                },
-                min: 4000, // Start at 4kHz to eliminate low-frequency noise
-                max: 20000, // Upper limit for better visibility
-                ticks: {
-                    stepSize: 1000
-                },
-                stacked: true
-            },
-            y: {
-                beginAtZero: true,
-                title: {
-                    display: true,
-                    text: 'Amplitude'
-                },
-                stacked: false
-            }
-        },
-        plugins: {
-            legend: {
-                display: true,
-                position: 'top',
-            }
-        },
-        animation: {
-            duration: 0 // Disable animations for instant updates
-        }
+let coins = [];
+let recordings = [];
+let activeCapture = null;
+let captureMode = null;
+let focusedAttempts = [];
+let detailCoinId = null;
+let transientCoin = null;
+let teachingDraft = null;
+let draftRecordings = [];
+let toastTimer;
+const diagnosticUrls = { teach: null, detail: null };
+
+function toast(message, error = false) {
+  const element = $('#toast');
+  element.textContent = message;
+  element.className = `toast show${error ? ' error' : ''}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => element.className = 'toast', 3600);
+}
+
+function coinById(coinId) {
+  return coins.find(item => item.id === coinId) || (transientCoin?.id === coinId ? transientCoin : null);
+}
+
+function coinRecordings(coinId) {
+  if (teachingDraft?.id === coinId) return draftRecordings;
+  return recordings.filter(recording => recording.coinId === coinId && recording.features?.quality?.accepted);
+}
+
+function profileFor(coinId) {
+  const coin = coinById(coinId);
+  if (coin?.referenceProfile) return coin.referenceProfile;
+  return buildProfile(coinRecordings(coinId), coin?.includedFrequencies);
+}
+
+function profileIsReady(coin, profile = profileFor(coin.id)) {
+  return Boolean(profile && profile.resonances.length >= 2 &&
+    (profile.isReference || profile.sampleCount >= TRAINING_TARGET));
+}
+
+function coinImageMarkup(coin, detail = false) {
+  if (!coin.image) return '';
+  const attribution = detail
+    ? `<a class="image-credit" href="${escapeHtml(coin.image.source)}" target="_blank" rel="noreferrer">${escapeHtml(coin.image.credit)} · ${escapeHtml(coin.image.license)}</a>`
+    : '';
+  return `<figure class="coin-image ${detail ? 'detail-image' : ''}"><img src="${escapeHtml(coin.image.path)}" alt="${escapeHtml(coin.image.alt)}">${attribution}</figure>`;
+}
+
+function showView(name) {
+  $$('.view').forEach(view => view.classList.toggle('active', view.id === `${name}-view`));
+  if (name !== captureMode) stopCapture();
+  if (name === 'teach') renderTeach();
+  if (name === 'library') renderLibrary();
+}
+
+function frequenciesParam(coin) {
+  return profileFor(coin.id).resonances.map(item => Number(item.frequency.toFixed(2))).join(',');
+}
+
+function frequencyTargetUrl(coin) {
+  const params = new URLSearchParams({
+    name: coin.name,
+    frequencies: frequenciesParam(coin)
+  });
+  return `${location.pathname}?${params}`;
+}
+
+function identifyUrl(coin) {
+  return frequencyTargetUrl(coin);
+}
+
+function teachUrl(coinId) {
+  return `${location.pathname}?teach=${encodeURIComponent(coinId)}`;
+}
+
+function navigate(url, replace = false) {
+  history[replace ? 'replaceState' : 'pushState']({}, '', url);
+  applyRoute();
+}
+
+function navigateLibrary(replace = false) {
+  navigate(location.pathname, replace);
+}
+
+function followInternalLink(event, url) {
+  if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  navigate(url);
+}
+
+function renderLibrary() {
+  const grid = $('#coin-grid');
+  grid.replaceChildren();
+  if (!coins.length) {
+    grid.innerHTML = '<div class="card empty"><strong>No coin profiles yet</strong>Add your first specimen, then record several pings to teach its acoustic signature.</div>';
+    return;
+  }
+  coins.slice().sort((a,b) => b.createdAt.localeCompare(a.createdAt)).forEach(coin => {
+    const profile = profileFor(coin.id);
+    const card = document.createElement('article');
+    card.className = 'card coin-card';
+    const ready = profileIsReady(coin, profile);
+    const status = coin.builtIn ? 'Built-in' : ready ? 'Saved coin' : 'Calibration incomplete';
+    card.innerHTML = `
+      ${coinImageMarkup(coin)}
+      <span class="badge ${ready ? '' : 'warn'}">${status}</span>
+      <h3>${escapeHtml(coin.name)}</h3>
+      <div class="resonances">${profile.resonances.slice(0,4).map(r => `<span class="resonance">${formatHz(r.frequency)}</span>`).join('') || '<span class="hint">No stable resonances yet</span>'}</div>
+      <div class="actions">${ready ? `<a class="btn primary identify-card" href="${escapeHtml(identifyUrl(coin))}">Identify</a>` : `<a class="btn primary teach-card" href="${escapeHtml(teachUrl(coin.id))}">Finish calibration</a>`}</div>`;
+    const identifyLink = card.querySelector('.identify-card');
+    if (identifyLink) identifyLink.onclick = event => followInternalLink(event, identifyLink.href);
+    const teachLink = card.querySelector('.teach-card');
+    if (teachLink) teachLink.onclick = event => followInternalLink(event, teachLink.href);
+    grid.appendChild(card);
+  });
+}
+
+function openTeach(coinId) {
+  const coin = teachingDraft?.id === coinId
+    ? teachingDraft
+    : coins.find(item => item.id === coinId && !item.builtIn && !item.referenceProfile);
+  if (!coin) return false;
+  detailCoinId = coinId;
+  transientCoin = teachingDraft?.id === coinId ? teachingDraft : null;
+  document.title = `Create ${coin.name} — CoinTone`;
+  showView('teach');
+  return true;
+}
+
+function renderTeach() {
+  const selected = detailCoinId;
+  const items = coinRecordings(selected).sort((a,b) => b.createdAt.localeCompare(a.createdAt));
+  const coin = teachingDraft?.id === selected ? teachingDraft : coins.find(item => item.id === selected && !item.builtIn);
+  const profile = buildProfile(items, coin?.includedFrequencies);
+  $('#teach-title').textContent = coin ? `Create ${coin.name}` : 'Create your coin';
+  $('#teach-coin-name').textContent = coin?.name || 'No coin selected';
+  $('#teach-coin-meta').textContent = coin
+    ? 'Calibrate its acoustic profile before adding it to your library.'
+    : 'Return to the library and create a coin.';
+  $('#teach-count').textContent = `${Math.min(items.length, TRAINING_TARGET)} / ${TRAINING_TARGET}`;
+  $('#teach-progress').style.width = `${Math.min(100, items.length / TRAINING_TARGET * 100)}%`;
+  $('#teach-frequencies').innerHTML = profile.candidates.map(item => {
+    const support = Math.round(item.support * 100);
+    const status = item.automatic ? 'Common' : item.manuallyIncluded ? 'Included' : 'Observed';
+    return `<label class="frequency-choice ${item.selected ? 'selected' : ''}">
+      <input type="checkbox" data-frequency="${item.frequency}" ${item.selected ? 'checked' : ''} ${item.automatic ? 'disabled' : ''}>
+      <span><b>${formatHz(item.frequency)}</b><small>${support}% · ${item.occurrences}/${items.length} readings · ${status}</small></span>
+    </label>`;
+  }).join('') || '<span class="hint">No frequencies detected yet.</span>';
+  $$('#teach-frequencies input:not(:disabled)').forEach(input => input.onchange = () => setFrequencyIncluded(selected, Number(input.dataset.frequency), input.checked));
+  const automaticCount = profile.candidates.filter(item => item.automatic).length;
+  const manualCount = profile.candidates.filter(item => item.manuallyIncluded && !item.automatic).length;
+  $('#teach-frequency-help').textContent = items.length < 2
+    ? 'All detected frequencies are shown. Add another reading to find the common ones.'
+    : `${automaticCount} selected automatically at 80% support${manualCount ? `; ${manualCount} included by you` : ''}. Select an occasional frequency to keep it in the learned profile.`;
+  const canFinish = items.length >= TRAINING_TARGET && profile.resonances.length >= 2;
+  $('#finish-teach').disabled = !canFinish;
+  $('#finish-teach-help').textContent = canFinish
+    ? `${profile.resonances.length} frequencies selected. Add this coin to your library when ready.`
+    : `Complete ${Math.max(0, TRAINING_TARGET - items.length)} more accepted reading${TRAINING_TARGET - items.length === 1 ? '' : 's'} and select at least two frequencies.`;
+  $('#teach-start').disabled = !coin;
+}
+
+function setCaptureUI(mode, state) {
+  const orb = $(`#${mode}-orb`), status = $(`#${mode}-status`), copy = $(`#${mode}-copy`);
+  if (!orb || !status || !copy) return;
+  orb.className = `mic-orb ${state === 'recording' ? 'recording' : ['calibrating','listening','cooldown'].includes(state) ? 'listening' : ''}`;
+  const idleCopy = mode === 'teach'
+    ? 'We will first measure the room, then automatically capture the complete ring.'
+    : 'Microphone access starts automatically while this coin identifier is open.';
+  const messages = {
+    idle: [mode === 'detail' ? 'Starting microphone…' : 'Ready to listen', idleCopy],
+    calibrating: ['Measuring the room…', 'Stay quiet for a moment while we establish the ambient noise floor.'],
+    listening: ['Listening for a ping', 'Ping the coin once. Capture begins automatically.'],
+    recording: ['Capturing the ring…', 'Let the sound decay naturally; do not make another impact yet.'],
+    cooldown: ['Analyzing reading…', 'Extracting stable resonances and checking recording quality.']
+  };
+  [status.textContent, copy.textContent] = messages[state] || messages.idle;
+}
+
+async function startCapture(mode) {
+  if (activeCapture) return;
+  if (mode === 'teach' && teachingDraft?.id !== detailCoinId && !coins.some(coin => coin.id === detailCoinId && !coin.builtIn && !coin.referenceProfile)) return toast('Create a coin first.', true);
+  if (mode === 'detail') {
+    const profile = profileFor(detailCoinId);
+    if (!profile || (!profile.isReference && profile.sampleCount < TRAINING_TARGET) || profile.resonances.length < 2) {
+      return toast('Teach this coin with five accepted readings before identifying it.', true);
     }
-});
-
-// Event Listeners
-startButton.addEventListener('click', startAnalysis);
-stopButton.addEventListener('click', stopAnalysis);
-
-// Load settings from local storage
-function loadSettings() {
-    const xScale = localStorage.getItem('xScale') || 'linear';
-    const pingTimeout = localStorage.getItem('pingTimeout') || 10;
-
-    document.getElementById('xScale').value = xScale;
-    document.getElementById('pingTimeout').value = pingTimeout;
-
-    return { xScale, pingTimeout };
+  }
+  captureMode = mode;
+  const start = $(`#${mode}-start`), stop = $(`#${mode}-stop`);
+  if (start) start.hidden = true;
+  if (stop) stop.hidden = false;
+  activeCapture = new PingCapture({
+    onState: state => setCaptureUI(mode, state),
+    onLevel: level => $(`#${mode}-level`).style.width = `${Math.round(level * 100)}%`,
+    onPing: payload => handlePing(mode, payload),
+    onError: error => toast(microphoneMessage(error), true)
+  });
+  try { await activeCapture.start(); }
+  catch {
+    if (start) start.hidden = false;
+    if (stop) stop.hidden = true;
+    activeCapture = null; captureMode = null;
+    setCaptureUI(mode, 'idle');
+  }
 }
 
-// Save settings to local storage
-function saveSettings() {
-    const xScale = document.getElementById('xScale').value;
-    const pingTimeout = document.getElementById('pingTimeout').value;
-
-    localStorage.setItem('xScale', xScale);
-    localStorage.setItem('pingTimeout', pingTimeout);
+function microphoneMessage(error) {
+  if (!window.isSecureContext) return 'Microphone capture requires HTTPS or localhost.';
+  if (error?.name === 'NotAllowedError') return 'Microphone permission was denied. Allow access in your browser settings.';
+  return `Could not start the microphone: ${error?.message || 'unknown error'}`;
 }
 
-// Reset settings to default values
-function resetSettings() {
-    localStorage.setItem('xScale', 'linear');
-    localStorage.setItem('pingTimeout', 200);
-
-    document.getElementById('xScale').value = 'linear';
-    document.getElementById('pingTimeout').value = 200;
-
-    updateChartOptions('linear');
-    alert('Settings reset to default values!');
+async function stopCapture() {
+  if (!activeCapture) return;
+  const mode = captureMode;
+  const capture = activeCapture;
+  activeCapture = null; captureMode = null;
+  await capture.stop();
+  if (mode) {
+    const start = $(`#${mode}-start`), stop = $(`#${mode}-stop`);
+    if (start) start.hidden = false;
+    if (stop) stop.hidden = true;
+    setCaptureUI(mode, 'idle');
+  }
 }
 
-// Update chart options based on settings
-function updateChartOptions(xScale) {
-    chart.options.scales.x.type = xScale;
-    chart.update();
+function pauseCaptureDuringPlayback(audio, mode) {
+  let stopPromise = Promise.resolve();
+  audio.addEventListener('play', () => { stopPromise = stopCapture(); });
+  const resume = async () => {
+    await stopPromise;
+    if (mode === 'detail' && $('#detail-view').classList.contains('active') && !activeCapture) startCapture('detail');
+  };
+  audio.addEventListener('ended', resume);
+  audio.addEventListener('pause', () => setTimeout(resume, 0));
 }
 
-// Event listeners for settings inputs
-document.getElementById('xScale').addEventListener('change', () => {
-    saveSettings();
-    updateChartOptions(document.getElementById('xScale').value);
-});
-
-document.getElementById('pingTimeout').addEventListener('input', saveSettings);
-
-// Event listener for reset settings button
-document.getElementById('resetSettingsButton').addEventListener('click', resetSettings);
-
-// Load settings and apply them
-const { xScale, pingTimeout } = loadSettings();
-updateChartOptions(xScale);
-
-// Start Analysis Function
-function startAnalysis() {
-    startButton.disabled = true;
-    stopButton.disabled = false;
-    statusIndicator.textContent = 'Status: Initializing...';
-    statusIndicator.style.color = 'orange';
-
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    analyser = audioContext.createAnalyser();
-    analyser.fftSize = 16384; // Increased for better frequency resolution
-
-    // Create a high-pass filter to cut off frequencies below 4kHz
-    highPassFilter = audioContext.createBiquadFilter();
-    highPassFilter.type = 'highpass';
-    highPassFilter.frequency.value = 4000; // 4kHz cutoff
-
-    navigator.mediaDevices.getUserMedia({ audio: true })
-        .then(stream => {
-            microphone = audioContext.createMediaStreamSource(stream);
-            microphone.connect(highPassFilter);
-            highPassFilter.connect(analyser);
-            dataArray = new Uint8Array(analyser.fftSize);
-            frequencyDataArray = new Uint8Array(analyser.frequencyBinCount);
-            initializeChartLabels();
-            statusIndicator.textContent = 'Status: Listening...';
-            statusIndicator.style.color = 'green';
-            detectPing(pingTimeout);
-        })
-        .catch(err => {
-            console.error('Error accessing microphone', err);
-            alert('Microphone access denied or not available.');
-            statusIndicator.textContent = 'Status: Error';
-            statusIndicator.style.color = 'red';
-            startButton.disabled = false;
-            stopButton.disabled = true;
-        });
+function renderDiagnostic(mode, payload, features) {
+  const panel = $(`#${mode}-diagnostic`);
+  if (diagnosticUrls[mode]) URL.revokeObjectURL(diagnosticUrls[mode]);
+  const wav = encodeWav(payload.samples, payload.sampleRate);
+  const url = URL.createObjectURL(wav);
+  diagnosticUrls[mode] = url;
+  const quality = features.quality;
+  const heading = document.createElement('h4');
+  heading.textContent = quality.accepted ? 'Last capture · accepted' : 'Last capture · rejected';
+  const summary = document.createElement('p');
+  summary.className = quality.accepted ? 'diagnostic-status good' : 'diagnostic-status bad';
+  summary.textContent = quality.accepted ? 'This recording passed all checks.' : quality.reasons.join(' · ');
+  const stats = document.createElement('div');
+  stats.className = 'diagnostic-stats';
+  const values = [
+    ['Captured', `${(payload.samples.length / payload.sampleRate).toFixed(2)} s`],
+    ['Measured ring', `${quality.ringDuration.toFixed(2)} s`],
+    ['Peak', `${(quality.peak * 100).toFixed(1)}%`],
+    ['Signal / noise', `${quality.snrDb.toFixed(1)} dB`],
+    ['Resonances', String(relevantResonances(features).length)],
+    ['Input', payload.metadata.device || 'Default microphone']
+  ];
+  values.forEach(([label, value]) => {
+    const item = document.createElement('span');
+    const name = document.createElement('small'); name.textContent = label;
+    const content = document.createElement('b'); content.textContent = value;
+    item.append(name, content); stats.appendChild(item);
+  });
+  const resonanceHeading = document.createElement('h4');
+  resonanceHeading.textContent = 'Frequencies found';
+  const resonances = document.createElement('div');
+  resonances.className = 'resonances';
+  resonances.innerHTML = relevantResonances(features).map(item => `<span class="resonance">${formatHz(item.frequency)}</span>`).join('') || '<span class="hint">No stable frequencies found.</span>';
+  const audio = document.createElement('audio');
+  audio.controls = true; audio.preload = 'metadata'; audio.src = url;
+  pauseCaptureDuringPlayback(audio, mode);
+  const download = document.createElement('a');
+  download.className = 'btn diagnostic-download'; download.href = url;
+  download.download = `resonance-${mode}-${new Date().toISOString().replace(/[:.]/g, '-')}.wav`;
+  download.textContent = 'Download captured WAV';
+  const help = document.createElement('p');
+  help.className = 'hint';
+  help.textContent = 'Play this back to hear exactly what the app received. Playback stops microphone capture to prevent feedback.';
+  panel.replaceChildren(heading, summary, stats, resonanceHeading, resonances, audio, download, help);
+  panel.hidden = false;
 }
 
-// Stop Analysis Function
-function stopAnalysis() {
-    startButton.disabled = false;
-    stopButton.disabled = true;
-    statusIndicator.textContent = 'Status: Idle';
-    statusIndicator.style.color = 'green';
-
-    if (animationId) {
-        cancelAnimationFrame(animationId);
+async function handlePing(mode, payload) {
+  const features = analyzePing(payload.samples, payload.sampleRate);
+  renderDiagnostic(mode, payload, features);
+  if (!features.quality.accepted) {
+    toast(`Reading rejected: ${features.quality.reasons.join(', ')}. Try again.`, true);
+    return;
+  }
+  if (mode === 'teach') {
+    const coinId = detailCoinId;
+    const coin = teachingDraft?.id === coinId ? teachingDraft : coins.find(item => item.id === coinId && !item.builtIn && !item.referenceProfile);
+    if (!coin) return;
+    const record = {
+      id: uid(), coinId, createdAt: new Date().toISOString(), sampleRate: payload.sampleRate,
+      duration: payload.samples.length / payload.sampleRate, metadata: payload.metadata,
+      features, wav: encodeWav(payload.samples, payload.sampleRate), algorithmVersion: 1
+    };
+    if (teachingDraft?.id === coinId) draftRecordings.push(record);
+    else {
+      await put('recordings', record);
+      recordings.push(record);
     }
-    if (microphone) {
-        microphone.disconnect();
-    }
-    if (highPassFilter) {
-        highPassFilter.disconnect();
-    }
-    if (audioContext) {
-        audioContext.close();
-    }
-    chart.data.datasets[0].data = []; // Clear detected frequencies
-    chart.update('none');
+    renderTeach();
+    toast(`Accepted: ${relevantResonances(features).length} stable resonances found.`);
+  } else if (mode === 'detail') {
+    const outcome = identifyPing(features, detailCoinId);
+    focusedAttempts.unshift({ id: uid(), features, payload, outcome, capturedAt: new Date().toISOString() });
+    renderFocusedReadings();
+    renderFocusedResult(outcome);
+    const coin = coinById(detailCoinId);
+    toast(outcome.accepted
+      ? `This ping matches ${coin.name} (${outcome.best.score}%).`
+      : outcome.suggestion
+        ? `Not ${coin.name}; maybe ${outcome.suggestion.coin.name} (${outcome.suggestion.score}%).`
+        : `This ping does not confidently match ${coin.name}.`);
+  }
 }
 
-// Initialize Chart Labels
-function initializeChartLabels() {
-    const nyquist = audioContext.sampleRate / 2;
-    const frequencyStep = nyquist / analyser.frequencyBinCount;
-    const labels = [];
-    for (let i = 0; i < analyser.frequencyBinCount; i++) {
-        const freq = i * frequencyStep;
-        if (freq >= 4000 && freq <= 20000) { // Focus on 4kHz to 20kHz
-            labels.push(freq.toFixed(0));
-        }
+function identifyPing(features, coinId) {
+  const coin = coinById(coinId);
+  if (!coin) return { unavailable: true, accepted: false };
+  const profile = profileFor(coinId);
+  if (!profileIsReady(coin, profile)) return { unavailable: true, accepted: false };
+  const best = { coin, profile, ...matchProfile(features, profile) };
+  let suggestion = null;
+  if (best.score < 50) {
+    suggestion = coins
+      .filter(item => item.id !== coinId)
+      .map(item => ({ coin: item, profile: profileFor(item.id) }))
+      .filter(item => profileIsReady(item.coin, item.profile))
+      .map(item => ({ ...item, ...matchProfile(features, item.profile) }))
+      .filter(item => item.score >= 50 && item.matched >= 2)
+      .sort((a, b) => b.score - a.score)[0] || null;
+  }
+  return { best, suggestion, accepted: best.score >= 62 && best.matched >= 2, focused: true };
+}
+
+function renderFocusedResult(outcome, label = 'Last ping') {
+  const result = $('#detail-result');
+  if (!result || !outcome) return;
+  if (outcome.unavailable) {
+    result.innerHTML = `<div class="result unknown"><span class="badge warn">${escapeHtml(label)}</span><h4>Profile not ready</h4><p>Teach this coin before trying to identify it.</p></div>`;
+    return;
+  }
+  const { best, accepted, suggestion } = outcome;
+  const suggestionMarkup = suggestion ? `<a class="possible-match" href="${escapeHtml(identifyUrl(suggestion.coin))}">
+    ${suggestion.coin.image ? `<img src="${escapeHtml(suggestion.coin.image.path)}" alt="">` : ''}
+    <span><small>Possible alternative</small><b>Maybe this is ${escapeHtml(suggestion.coin.name)}</b><small>${suggestion.score}% similarity · ${suggestion.matched} resonances matched · Open identifier →</small></span>
+  </a>` : '';
+  result.innerHTML = `<div class="result ${accepted ? '' : 'unknown'}">
+    <span class="badge ${accepted ? '' : 'warn'}">${escapeHtml(label)}</span>
+    <h4>${accepted ? `Matches ${escapeHtml(best.coin.name)}` : `Not a confident match`}</h4>
+    <div class="score">${best.score}%</div>
+    <p>${best.matched} of ${best.profile.resonances.length} profile resonances matched.</p>
+    ${suggestionMarkup}
+    <p class="hint">Primarily compared with ${escapeHtml(best.coin.name)}. If similarity is below 50%, other ready profiles are checked for a possible alternative. Scores are not proof of authenticity.</p>
+  </div>`;
+  const suggestionLink = result.querySelector('.possible-match');
+  if (suggestionLink) suggestionLink.onclick = event => followInternalLink(event, suggestionLink.href);
+}
+
+function renderFocusedReadings() {
+  const list = $('#detail-identify-readings');
+  if (!list) return;
+  list.innerHTML = focusedAttempts.map((attempt, index) => {
+    const suggestion = attempt.outcome.suggestion;
+    const title = attempt.outcome.accepted ? 'Match' : suggestion ? `Maybe ${suggestion.coin.name}` : 'Not a match';
+    const score = attempt.outcome.accepted ? attempt.outcome.best?.score : suggestion?.score || attempt.outcome.best?.score || 0;
+    return `<button class="reading reading-button inspect-focused" data-id="${attempt.id}">${suggestion?.coin.image ? `<img class="reading-coin-image" src="${escapeHtml(suggestion.coin.image.path)}" alt="">` : ''}<span class="reading-summary"><b>${escapeHtml(title)}</b><small>${score}% similarity</small></span><span class="reading-number">Ping ${focusedAttempts.length - index}</span></button>`;
+  }).join('') || '<p class="hint">No pings tested against this coin yet.</p>';
+  $$('#detail-identify-readings .inspect-focused').forEach(button => button.onclick = () => inspectFocusedAttempt(button.dataset.id));
+}
+
+function inspectFocusedAttempt(attemptId) {
+  const attempt = focusedAttempts.find(item => item.id === attemptId);
+  if (!attempt) return;
+  const number = focusedAttempts.length - focusedAttempts.indexOf(attempt);
+  renderFocusedResult(attempt.outcome, `Ping ${number}`);
+  renderDiagnostic('detail', attempt.payload, attempt.features);
+  $('#detail-result')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function showDetail(coinId) {
+  if (detailCoinId !== coinId) {
+    await stopCapture();
+    focusedAttempts = [];
+  }
+  detailCoinId = coinId;
+  const coin = coinById(coinId);
+  if (!coin) return;
+  document.title = `Identify ${coin.name} — CoinTone`;
+  const items = coinRecordings(coinId).sort((a,b) => b.createdAt.localeCompare(a.createdAt));
+  const profile = profileFor(coinId);
+  const learned = buildProfile(items, coin.includedFrequencies);
+  const ready = profile.isReference || (profile.sampleCount >= TRAINING_TARGET && profile.resonances.length >= 2);
+  $('#detail-content').innerHTML = `
+    <div class="hero detail-head"><div><h2>Identify ${escapeHtml(coin.name)}</h2><p>Test each ping only against this coin’s acoustic profile.</p></div><div>${coin.urlOnly ? '<button id="add-shared-coin" class="btn primary">Add to library</button> ' : ''}<button id="copy-identify-link" class="btn" ${ready ? '' : 'disabled'}>Copy link</button>${!coin.builtIn && !coin.urlOnly ? ' <button id="delete-profile" class="btn danger">Delete</button>' : ''}</div></div>
+    <div class="flow detail-identify">
+      <section class="card capture" aria-live="polite">
+        <div id="detail-orb" class="mic-orb"><span class="mic-icon">⌁</span></div>
+        <h3 id="detail-status">${ready ? 'Starting microphone…' : 'Profile not ready'}</h3>
+        <p id="detail-copy" class="capture-copy">${ready ? 'Listening starts automatically. Ping the coin whenever you are ready.' : `Complete ${TRAINING_TARGET} accepted teaching readings before identification.`}</p>
+        <div class="meter"><span id="detail-level"></span></div>
+        <p class="listening-note">${ready ? '● Microphone stays active while this page is open' : 'Microphone is inactive'}</p>
+        <div id="detail-result" class="latest-result"></div>
+        <div id="detail-diagnostic" class="diagnostic" hidden></div>
+      </section>
+      <aside class="card focused-profile">
+        ${coinImageMarkup(coin, true)}
+        <h3>${escapeHtml(coin.name)}</h3>
+        <p class="hint">${ready ? 'Results here are not affected by similar coins elsewhere in your library.' : `Complete ${TRAINING_TARGET} accepted teaching readings before identification.`}</p>
+        <div class="resonances">${profile.resonances.map(r => `<span class="resonance">${formatHz(r.frequency)}</span>`).join('') || '<span class="hint">No learned frequencies yet.</span>'}</div>
+        <h4>Recent tests</h4>
+        <div id="detail-identify-readings" class="readings"></div>
+      </aside>
+    </div>
+    <div class="card"><h3>Target frequencies</h3><div class="resonances">${profile.resonances.map(r => `<span class="resonance">${formatHz(r.frequency)}${r.tolerance ? ` · ±${(r.tolerance * 100).toFixed(1)}%` : ''}</span>`).join('')}</div><p class="hint">This identifier stores only the coin name and target frequencies.</p></div>`;
+  $('#copy-identify-link').onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(new URL(frequencyTargetUrl(coin), location.href).href);
+      toast('Shareable frequency identifier link copied.');
+    } catch {
+      toast('Could not copy automatically. Copy the URL from the address bar.', true);
     }
-    chart.data.labels = labels;
+  };
+  const addButton = $('#add-shared-coin');
+  if (addButton) addButton.onclick = () => addSharedCoin(coin);
+  const deleteButton = $('#delete-profile');
+  if (deleteButton) deleteButton.onclick = () => deleteProfile(coin);
+  renderFocusedReadings();
+  showView('detail');
+  if (ready) await startCapture('detail');
 }
 
-// New variable to store the highest detected amplitude during cooldown
-let coolingPing = 0;
+async function setFrequencyIncluded(coinId, frequency, included) {
+  const coin = teachingDraft?.id === coinId ? teachingDraft : coins.find(item => item.id === coinId);
+  if (!coin || coin.builtIn) return;
+  const current = coin.includedFrequencies || [];
+  const tolerance = Math.max(45, frequency * .012);
+  coin.includedFrequencies = included
+    ? [...current.filter(item => Math.abs(item - frequency) > tolerance), frequency]
+    : current.filter(item => Math.abs(item - frequency) > tolerance);
+  if (teachingDraft?.id !== coinId) await put('coins', coin);
+  renderTeach();
+  toast(included ? `${formatHz(frequency)} added to the learned profile.` : `${formatHz(frequency)} removed from the learned profile.`);
+}
 
-// Ping Detection and Analysis
-function detectPing(pingTimeout) {
-    analyser.getByteFrequencyData(frequencyDataArray);
-    let pingDetected = false;
-    let maxAmplitude = 0;
+function profileFromFrequencies(frequencies, consistency = 'Saved') {
+  return {
+    isReference: true,
+    sampleCount: 0,
+    consistency,
+    resonances: frequencies.map(frequency => ({ frequency, tolerance: .02, support: 1, strength: 1, decay: null }))
+  };
+}
 
-    // Check if any frequency has an amplitude above 100 and find the max amplitude
-    for (let i = 0; i < frequencyDataArray.length; i++) {
-        if (frequencyDataArray[i] > 100) {
-            pingDetected = true;
-            if (frequencyDataArray[i] > maxAmplitude) {
-                maxAmplitude = frequencyDataArray[i];
-            }
-        }
+async function finishTeaching() {
+  const coin = teachingDraft?.id === detailCoinId ? teachingDraft : coins.find(item => item.id === detailCoinId);
+  if (!coin) return;
+  const items = coinRecordings(coin.id);
+  const profile = buildProfile(items, coin.includedFrequencies);
+  if (items.length < TRAINING_TARGET || profile.resonances.length < 2) return toast('Complete five readings and select at least two frequencies first.', true);
+  await stopCapture();
+  const saved = {
+    id: coin.id,
+    name: coin.name,
+    createdAt: coin.createdAt || new Date().toISOString(),
+    referenceProfile: profileFromFrequencies(profile.resonances.map(item => Number(item.frequency.toFixed(2))))
+  };
+  await put('coins', saved);
+  if (!coins.some(item => item.id === saved.id)) coins.push(saved);
+  else coins = coins.map(item => item.id === saved.id ? saved : item);
+  const oldRecordings = recordings.filter(item => item.coinId === saved.id);
+  await Promise.all(oldRecordings.map(item => remove('recordings', item.id)));
+  recordings = recordings.filter(item => item.coinId !== saved.id);
+  teachingDraft = null;
+  draftRecordings = [];
+  transientCoin = null;
+  renderLibrary();
+  navigate(identifyUrl(saved), true);
+  toast(`${saved.name} was added to your library.`);
+}
+
+async function addSharedCoin(coin) {
+  const frequencies = profileFor(coin.id).resonances.map(item => Number(item.frequency.toFixed(2)));
+  const saved = {
+    id: uid(),
+    name: coin.name,
+    createdAt: new Date().toISOString(),
+    referenceProfile: profileFromFrequencies(frequencies, 'Shared')
+  };
+  await put('coins', saved);
+  coins.push(saved);
+  transientCoin = null;
+  detailCoinId = saved.id;
+  renderLibrary();
+  navigate(identifyUrl(saved), true);
+  toast(`${saved.name} was added to your library.`);
+}
+
+async function deleteProfile(coin) {
+  const action = coin.builtIn ? 'Hide' : 'Delete';
+  if (!confirm(`${action} “${coin.name}” and delete all of its recordings? This cannot be undone.`)) return;
+  await deleteCoinAndRecordings(coin.id);
+  if (coin.builtIn) {
+    const hidden = new Set(JSON.parse(localStorage.getItem('resonance-hidden-references') || '[]'));
+    hidden.add(coin.id);
+    localStorage.setItem('resonance-hidden-references', JSON.stringify([...hidden]));
+  }
+  coins = coins.filter(item => item.id !== coin.id);
+  recordings = recordings.filter(item => item.coinId !== coin.id);
+  detailCoinId = null; renderLibrary(); navigateLibrary(true); toast('Coin profile deleted.');
+}
+
+function wireEvents() {
+  $('#new-coin').onclick = () => { $('#coin-form').reset(); $('#coin-dialog').showModal(); };
+  $('#close-dialog').onclick = $('#cancel-dialog').onclick = () => $('#coin-dialog').close();
+  $('#coin-form').onsubmit = async event => {
+    event.preventDefault();
+    if (!$('#coin-name').value.trim()) return;
+    const coin = {
+      id: uid(), name: $('#coin-name').value.trim(), includedFrequencies: [], createdAt: new Date().toISOString()
+    };
+    teachingDraft = coin;
+    draftRecordings = [];
+    $('#coin-form').reset();
+    $('#coin-dialog').close();
+    navigate(teachUrl(coin.id));
+    toast('Make five clean pings, then add the coin to your library.');
+  };
+  $('#teach-start').onclick = () => startCapture('teach');
+  $('#teach-stop').onclick = stopCapture;
+  $('#finish-teach').onclick = finishTeaching;
+  $('#teach-back').onclick = $('#detail-back').onclick = () => navigateLibrary();
+  window.addEventListener('popstate', applyRoute);
+  window.addEventListener('beforeunload', () => {
+    activeCapture?.stop();
+    Object.values(diagnosticUrls).forEach(url => url && URL.revokeObjectURL(url));
+  });
+}
+
+function coinFromUrl(params) {
+  const name = (params.get('name') || '').trim().slice(0, 100);
+  const frequencies = (params.get('frequencies') || '')
+    .split(',')
+    .map(Number)
+    .filter(value => Number.isFinite(value) && value >= 2000 && value <= 24000)
+    .slice(0, 12);
+  if (!name || frequencies.length < 2) return null;
+
+  const existing = coins.find(coin => {
+    if (coin.name !== name) return false;
+    const known = profileFor(coin.id).resonances.map(item => Number(item.frequency.toFixed(2)));
+    return known.length === frequencies.length && known.every((value, index) => value === frequencies[index]);
+  });
+  if (existing) return existing;
+
+  return {
+    id: `url-${name}-${frequencies.join('-')}`,
+    name,
+    specimenId: 'Shared frequency target',
+    year: '',
+    createdAt: new Date(0).toISOString(),
+    builtIn: false,
+    urlOnly: true,
+    referenceProfile: {
+      isReference: true,
+      sampleCount: 0,
+      consistency: 'URL target',
+      resonances: frequencies.map(frequency => ({ frequency, tolerance: .02, support: 1, strength: 1, decay: null }))
     }
+  };
+}
 
-    // Update coolingPing with the highest detected amplitude
-    if (pingDetected && (maxAmplitude - 100) > coolingPing) {
-        coolingPing = maxAmplitude;
-        statusIndicator.textContent = 'Status: Ping Detected - Processing...';
-        statusIndicator.style.color = 'orange';
-        processPing(pingTimeout);
+async function applyRoute() {
+  const params = new URLSearchParams(location.search);
+  const teachId = params.get('teach');
+  if (teachId) {
+    if (!openTeach(teachId)) {
+      navigateLibrary(true);
+      toast('That teach profile is not available on this device.', true);
     }
+    return;
+  }
 
-    // Decay the coolingPing value over time
-    coolingPing = Math.max(0, coolingPing - 1); // Adjust the decay rate as needed
-
-    // Update the chart
-    updateChart();
-
-    animationId = requestAnimationFrame(() => detectPing(pingTimeout));
-}
-
-// Function to process the detected ping
-function processPing(pingTimeout) {
-    // Brief cooldown to collect the entire sound event
-    setTimeout(() => {
-        analyser.getByteFrequencyData(frequencyDataArray);
-
-        // Extract frequencies
-        const frequencies = getFrequencies(frequencyDataArray);
-
-        // Identify Coin
-        const { name: guessedCoin, matchingFrequencies, confidence } = identifyCoin(frequencies);
-
-        // Update Log
-        console.log('updating log');
-        updateLog(frequencies, guessedCoin, confidence);
-
-        // Highlight detected frequencies on the chart
-        highlightFrequencies(frequencies, matchingFrequencies, guessedCoin);
-
-        // Reset flags
-        pingDetected = false;
-        statusIndicator.textContent = 'Status: Listening...';
-        statusIndicator.style.color = 'green';
-
-    }, pingTimeout); // Use the user-defined timeout
-}
-
-// Function to get significant frequencies using peak detection
-function getFrequencies(frequencyData) {
-    const nyquist = audioContext.sampleRate / 2;
-    const frequencyStep = nyquist / frequencyData.length;
-    let peaks = [];
-
-    // Find peaks above a certain amplitude threshold
-    const amplitudeThreshold = 5; // Adjust as needed
-    for (let i = 1; i < frequencyData.length - 1; i++) {
-        if (frequencyData[i] > amplitudeThreshold &&
-            frequencyData[i] > frequencyData[i - 1] &&
-            frequencyData[i] > frequencyData[i + 1]) {
-            const frequency = i * frequencyStep;
-            peaks.push({ frequency, amplitude: frequencyData[i] });
-        }
+  const coinId = params.get('coin');
+  if (coinId) {
+    transientCoin = null;
+    if (coins.some(coin => coin.id === coinId)) await showDetail(coinId);
+    else {
+      navigateLibrary(true);
+      toast('That coin is not available on this device.', true);
     }
+    return;
+  }
 
-    // Sort peaks by amplitude descending
-    peaks.sort((a, b) => b.amplitude - a.amplitude);
+  const urlCoin = coinFromUrl(params);
+  if (urlCoin) {
+    transientCoin = urlCoin.urlOnly ? urlCoin : null;
+    await showDetail(urlCoin.id);
+    return;
+  }
 
-    // Remove nearby peaks (within 50 Hz) to avoid duplicates
-    const filteredPeaks = [];
-    const minSeparation = 50; // Hz
-    peaks.forEach(peak => {
-        if (!filteredPeaks.some(p => Math.abs(p.frequency - peak.frequency) < minSeparation)) {
-            filteredPeaks.push(peak);
-        }
-    });
-
-    // Return top 5 frequencies
-    return filteredPeaks.slice(0, 5);
+  transientCoin = null;
+  detailCoinId = null;
+  document.title = 'CoinTone — identify coins by sound';
+  showView('library');
 }
 
-// Function to identify the coin based on frequencies
-function identifyCoin(frequencies) {
-    let bestMatch = { name: "Unknown Coin", matchingFrequencies: [], confidence: 0 };
-
-    for (let coin of knownCoins) {
-        let matchCount = 0;
-        let matchingFrequencies = [];
-        let totalFrequencies = coin.frequencies.length;
-
-        // Iterate through the coin's frequencies
-        for (let freqObj of coin.frequencies) {
-            const tolerance = freqObj.value * (freqObj.tolerancePercent / 100);
-            const adjustedMin = freqObj.value - tolerance;
-            const adjustedMax = freqObj.value + tolerance;
-
-            // Check if any of the detected frequencies fall within the tolerance range for this frequency
-            const isInRange = frequencies.some(freq => {
-                const inRange = freq.frequency >= adjustedMin && freq.frequency <= adjustedMax;
-                if (inRange) {
-                    matchingFrequencies.push(freq);
-                }
-                return inRange;
-            });
-
-            if (isInRange) {
-                matchCount++;
-            }
-        }
-
-        // Calculate confidence as the ratio of matched frequencies to total frequencies
-        const confidence = (matchCount / totalFrequencies) * 100;
-
-        // If this coin has a higher confidence than the current best match, update the best match
-        if (confidence > bestMatch.confidence) {
-            bestMatch = { name: coin.name, matchingFrequencies, confidence };
-        }
+async function init() {
+  try {
+    let [savedCoins, savedRecordings] = await Promise.all([getAll('coins'), getAll('recordings')]);
+    // Compact profiles created by earlier versions: preserve the selected
+    // acoustic signature, then remove calibration audio and specimen metadata.
+    for (const coin of savedCoins.filter(item => !item.referenceProfile)) {
+      const items = savedRecordings.filter(item => item.coinId === coin.id && item.features?.quality?.accepted);
+      const learned = buildProfile(items, coin.includedFrequencies);
+      if (learned.sampleCount < TRAINING_TARGET || learned.resonances.length < 2) continue;
+      const compact = {
+        id: coin.id,
+        name: coin.name,
+        createdAt: coin.createdAt,
+        referenceProfile: profileFromFrequencies(learned.resonances.map(item => Number(item.frequency.toFixed(2))))
+      };
+      await put('coins', compact);
+      await Promise.all(items.map(item => remove('recordings', item.id)));
+      savedCoins = savedCoins.map(item => item.id === coin.id ? compact : item);
+      savedRecordings = savedRecordings.filter(item => item.coinId !== coin.id);
     }
-
-    return bestMatch;
+    const hidden = new Set(JSON.parse(localStorage.getItem('resonance-hidden-references') || '[]'));
+    coins = [...savedCoins, ...REFERENCE_COINS.filter(coin => !hidden.has(coin.id))];
+    recordings = savedRecordings;
+    wireEvents();
+    renderLibrary();
+    await applyRoute();
+  } catch (error) {
+    console.error(error); toast('Could not open local storage. Check browser privacy settings.', true);
+  }
 }
-
-// Function to update the detection log
-function updateLog(frequencies, guessedCoin, confidence) {
-    const time = new Date().toLocaleTimeString();
-    const freqString = frequencies.map(f => `${f.frequency.toFixed(0)} Hz (Amp: ${f.amplitude})`).join(', ');
-
-    const newRow = document.createElement('tr');
-    newRow.innerHTML = `
-        <td>${time}</td>
-        <td>${freqString}</td>
-        <td>${guessedCoin}</td>
-        <td>${confidence.toFixed(2)}%</td>
-    `;
-
-    logBody.prepend(newRow);
-
-    // Keep only the last 10 entries
-    while (logBody.rows.length > 10) {
-        logBody.deleteRow(-1);
-    }
-}
-
-// Function to update the Chart.js graph
-function updateChart() {
-    analyser.getByteFrequencyData(frequencyDataArray);
-
-    // Focus on frequencies between 4kHz and 20kHz
-    const nyquist = audioContext.sampleRate / 2;
-    const frequencyStep = nyquist / analyser.frequencyBinCount;
-    const filteredData = [];
-    const filteredLabels = [];
-    for (let i = 0; i < analyser.frequencyBinCount; i++) {
-        const freq = i * frequencyStep;
-        if (freq >= 4000 && freq <= 20000) { // Focus on 4kHz to 20kHz
-            filteredData.push(frequencyDataArray[i]);
-            filteredLabels.push(freq.toFixed(0));
-        }
-    }
-
-    chart.data.labels = filteredLabels;
-    chart.data.datasets[2].data = filteredData;
-    chart.update('none');
-}
-
-// Function to highlight detected frequencies on the chart
-function highlightFrequencies(frequencies, matchingFrequencies, guessedCoin) {
-    
-    // Prepare data for the detected frequencies bars
-    const detectedFreqData = new Array(chart.data.labels.length).fill(null);
-    const nonMatchingFreqData = new Array(chart.data.labels.length).fill(null);
-    const coinRangeData = new Array(chart.data.labels.length).fill(null);
-    
-    frequencies.forEach(freq => {
-        if (freq.frequency >= 4000 && freq.frequency <= 20000) {
-            // Find the closest label index
-            const index = chart.data.labels.findIndex(label => parseFloat(label) >= freq.frequency);
-            if (index !== -1) {
-                if (matchingFrequencies.some(mf => mf.frequency === freq.frequency)) {
-                    detectedFreqData[index] = freq.amplitude;
-                } else {
-                    nonMatchingFreqData[index] = freq.amplitude;
-                }
-            }
-        }
-    });
-
-    // Highlight the detected coin's frequencies
-    const detectedCoin = knownCoins.find(coin => coin.name === guessedCoin);
-    if (detectedCoin) {
-        detectedCoin.frequencies.forEach(freqObj => {
-            const tolerance = freqObj.value * (freqObj.tolerancePercent / 100);
-            const adjustedMin = freqObj.value - tolerance;
-            const adjustedMax = freqObj.value + tolerance;
-            chart.data.labels.forEach((label, index) => {
-                const freq = parseFloat(label);
-                if (freq >= adjustedMin && freq <= adjustedMax) {
-                    coinRangeData[index] = Math.max(...frequencyDataArray); // Set to max amplitude
-                }
-            });
-        });
-    }
-
-    // Update the chart data
-    chart.data.datasets[0].data = detectedFreqData;
-    chart.data.datasets[1].data = nonMatchingFreqData;
-    chart.data.datasets[3].data = coinRangeData;
-
-    // Update the chart without animation
-    chart.update('none');
-}
-
-// Default known coins
-const defaultKnownCoins = [
-    { 
-        name: "Sovereign", 
-        frequencies: [
-            { value: 5600, tolerancePercent: 5 },
-            { value: 12700, tolerancePercent: 5 }
-        ]
-    },
-    { 
-        name: "Krugerrand", 
-        frequencies: [
-            { value: 4900, tolerancePercent: 5 },
-            { value: 10915, tolerancePercent: 5 },
-            { value: 18500, tolerancePercent: 5 }
-        ]
-    }
-];
-
-// Load coin database from local storage
-function loadCoinDatabase() {
-    const storedCoins = localStorage.getItem('knownCoins');
-    if (storedCoins) {
-        return JSON.parse(storedCoins);
-    } else {
-        // Pre-populate with default known coins if local storage is empty
-        saveCoinDatabase(defaultKnownCoins);
-        return defaultKnownCoins;
-    }
-}
-
-// Save coin database to local storage
-function saveCoinDatabase(coins) {
-    localStorage.setItem('knownCoins', JSON.stringify(coins));
-}
-
-// Initialize coin database
-let knownCoins = loadCoinDatabase();
-
-// Update coin list in the UI
-function updateCoinList() {
-    const coinList = document.getElementById('coinList');
-    coinList.innerHTML = '';
-    knownCoins.forEach((coin, index) => {
-        const option = document.createElement('option');
-        option.value = index;
-        option.textContent = coin.name;
-        coinList.appendChild(option);
-    });
-}
-
-// Add a new coin
-function addCoin() {
-    const coinName = document.getElementById('coinName').value.trim();
-    if (coinName) {
-        knownCoins.push({ name: coinName, frequencies: [] });
-        saveCoinDatabase(knownCoins);
-        updateCoinList();
-        document.getElementById('coinName').value = '';
-    }
-}
-
-// Delete a selected coin
-function deleteCoin() {
-    const coinList = document.getElementById('coinList');
-    const selectedIndex = coinList.selectedIndex;
-    if (selectedIndex !== -1) {
-        knownCoins.splice(selectedIndex, 1);
-        saveCoinDatabase(knownCoins);
-        updateCoinList();
-        document.getElementById('frequencyList').innerHTML = '';
-    }
-}
-
-// Add a frequency to the selected coin
-function addFrequency() {
-    const coinList = document.getElementById('coinList');
-    const selectedIndex = coinList.selectedIndex;
-    if (selectedIndex !== -1) {
-        const frequencyValue = parseFloat(document.getElementById('frequencyValue').value);
-        const tolerancePercent = parseFloat(document.getElementById('tolerancePercent').value);
-        if (!isNaN(frequencyValue) && !isNaN(tolerancePercent)) {
-            knownCoins[selectedIndex].frequencies.push({ value: frequencyValue, tolerancePercent });
-            saveCoinDatabase(knownCoins);
-            updateFrequencyList(selectedIndex);
-            document.getElementById('frequencyValue').value = '';
-            document.getElementById('tolerancePercent').value = '';
-        }
-    }
-}
-
-// Update frequency list for the selected coin
-function updateFrequencyList(index) {
-    const frequencyList = document.getElementById('frequencyList');
-    frequencyList.innerHTML = '';
-    knownCoins[index].frequencies.forEach((freq, freqIndex) => {
-        const row = document.createElement('tr');
-        row.innerHTML = `
-            <td>${freq.value}</td>
-            <td>${freq.tolerancePercent}</td>
-            <td><button onclick="deleteFrequency(${index}, ${freqIndex})">Delete</button></td>
-        `;
-        frequencyList.appendChild(row);
-    });
-}
-
-// Delete a frequency from the selected coin
-function deleteFrequency(coinIndex, freqIndex) {
-    knownCoins[coinIndex].frequencies.splice(freqIndex, 1);
-    saveCoinDatabase(knownCoins);
-    updateFrequencyList(coinIndex);
-}
-
-// Event listeners for coin management
-document.getElementById('addCoinButton').addEventListener('click', addCoin);
-document.getElementById('deleteCoinButton').addEventListener('click', deleteCoin);
-document.getElementById('addFrequencyButton').addEventListener('click', addFrequency);
-document.getElementById('coinList').addEventListener('change', (e) => {
-    updateFrequencyList(e.target.selectedIndex);
-});
-
-// Initialize coin list on page load
-updateCoinList();
-
-document.addEventListener("DOMContentLoaded", function() {
-    const canvas = document.getElementById('myCanvas');
-    const context = canvas.getContext('2d');
-
-    function resizeCanvas() {
-        const aspectRatio = window.innerWidth / window.innerHeight;
-        if (aspectRatio > 1) {
-            // Landscape mode
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
-        } else {
-            // Portrait mode
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
-        }
-    }
-
-    window.addEventListener('resize', resizeCanvas);
-    resizeCanvas();
-});
+init();
