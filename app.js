@@ -135,7 +135,7 @@ function openTeach(coinId) {
   if (!coin) return false;
   detailCoinId = coinId;
   transientCoin = teachingDraft?.id === coinId ? teachingDraft : null;
-  document.title = `Create ${coin.name} — CoinTone`;
+  document.title = `Create ${coin.name} — Coin Pinger`;
   showView('teach');
   return true;
 }
@@ -406,7 +406,7 @@ async function showDetail(coinId) {
   detailCoinId = coinId;
   const coin = coinById(coinId);
   if (!coin) return;
-  document.title = `Identify ${coin.name} — CoinTone`;
+  document.title = `Identify ${coin.name} — Coin Pinger`;
   const items = coinRecordings(coinId).sort((a,b) => b.createdAt.localeCompare(a.createdAt));
   const profile = profileFor(coinId);
   const learned = buildProfile(items, coin.includedFrequencies);
@@ -626,7 +626,7 @@ async function applyRoute() {
 
   transientCoin = null;
   detailCoinId = null;
-  document.title = 'CoinTone — identify coins by sound';
+  document.title = 'Coin Pinger — identify coins by sound';
   showView('library');
 }
 

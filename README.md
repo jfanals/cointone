@@ -1,12 +1,12 @@
-# CoinTone
+# Coin Pinger
 
 Identify coins by sound, directly in your browser.
 
-CoinTone is a private, browser-based coin identifier with curated starter references and shareable frequency profiles. It captures complete pings, rejects poor recordings, extracts stable resonances, and tests each reading against the coin profile you choose.
+Coin Pinger is a private, browser-based coin identifier with curated starter references and shareable frequency profiles. It captures complete pings, rejects poor recordings, extracts stable resonances, and tests each reading against the coin profile you choose.
 
-**[Open CoinTone](https://jfanals.github.io/cointone/)**
+**[Open Coin Pinger](https://jfanals.github.io/coin-pinger/)**
 
-> CoinTone is an acoustic comparison tool, not proof of authenticity. Combine its results with weight, dimensions, and other physical tests.
+> Coin Pinger is an acoustic comparison tool, not proof of authenticity. Combine its results with weight, dimensions, and other physical tests.
 
 ## Features
 
@@ -44,7 +44,7 @@ Navigation is URL-based, so browser Back and Forward work normally. Local custom
 A portable identifier can be created without storing a coin by passing a name and at least two comma-separated frequencies in hertz:
 
 ```text
-https://jfanals.github.io/cointone/?name=My%20Coin&frequencies=5300,5420,12020
+https://jfanals.github.io/coin-pinger/?name=My%20Coin&frequencies=5300,5420,12020
 ```
 
 Opening that URL creates a temporary focused identifier with ±2% frequency tolerance. It is not saved automatically and no data is uploaded. Choose **Add to library** to retain its name and frequencies locally. Built-in and custom library links use this same simple format; when a link matches an existing coin, that local or bundled entry is restored automatically.
